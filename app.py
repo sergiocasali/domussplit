@@ -1,71 +1,54 @@
 import streamlit as st
 import pandas as pd
 import sqlite3
+import pdfplumber
+import re
 import urllib.parse
 from datetime import datetime
 
 # ---------------------------------------------------------
 # CONFIGURAZIONE PAGINA
 # ---------------------------------------------------------
-st.set_page_config(
-    page_title="DomusSplit",
-    page_icon="🏠",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
+st.set_page_config(page_title="DomusSplit Pro", page_icon="🏠", layout="wide")
 DB_NAME = "domus.db"
 
 # ---------------------------------------------------------
-# FUNZIONI DATABASE (SQLite)
+# DATABASE & ARCHIVIO
 # ---------------------------------------------------------
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS configurazione (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            parametro TEXT UNIQUE NOT NULL,
-            valore TEXT NOT NULL
-        )
-    ''')
-    
+    # Tabella Bollette ed Estrazioni OCR/PDF
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS bollette (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             servizio TEXT NOT NULL,
-            data_emissione DATE NOT NULL,
+            data_emissione DATE,
+            data_scadenza DATE,
             importo_totale REAL NOT NULL,
-            consumo_totale REAL,
-            consumo_claudio REAL,
+            kwh_totali REAL DEFAULT 0,
+            kwh_claudio REAL DEFAULT 0,
+            mc_gpl REAL DEFAULT 0,
+            prezzo_litro_gpl REAL DEFAULT 0,
             quota_claudio REAL NOT NULL,
             quota_sergio REAL NOT NULL,
             note TEXT
         )
     ''')
     
+    # Tabella Registro Incassi (Cash / Bonifici)
     cursor.execute('''
-        CREATE TABLE IF NOT EXISTS storico (
+        CREATE TABLE IF NOT EXISTS incassi (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            data_registrazione TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            periodo_riferimento TEXT NOT NULL,
-            importo_totale REAL NOT NULL,
-            quota_sergio REAL NOT NULL,
-            quota_claudio REAL NOT NULL,
-            stato_pagamento TEXT DEFAULT 'In Attesa',
+            data_incasso DATE NOT NULL,
+            importo REAL NOT NULL,
+            modalita TEXT NOT NULL, -- 'Bonifico' o 'Contanti'
+            iban_destinazione TEXT,
             note TEXT
         )
     ''')
     
-    # Inserimento valori di default se non presenti
-    defaults = [
-        ('gpl_rapporto_m3_litri', '4.17'),
-        ('tim_mobile_quota_fissa', '50.0')
-    ]
-    for param, val in defaults:
-        cursor.execute('INSERT OR IGNORE INTO configurazione (parametro, valore) VALUES (?, ?)', (param, val))
-        
     conn.commit()
     conn.close()
 
@@ -73,158 +56,170 @@ def get_connection():
     return sqlite3.connect(DB_NAME)
 
 # ---------------------------------------------------------
-# INIZIALIZZAZIONE DB E SESSIONE
+# MOTORE DI PARSING PDF (ESTRAZIONE AUTOMATICA)
+# ---------------------------------------------------------
+def estrai_dati_pdf(uploaded_file, servizio):
+    importo = 0.0
+    kwh_tot = 0.0
+    
+    with pdfplumber.open(uploaded_file) as pdf:
+        testo = ""
+        for page in pdf.pages:
+            testo += page.extract_text() or ""
+            
+    # Estrazione Regex dell'importo totale
+    match_importo = re.search(r'TOTAL[EO]\I?\s*DATI?\s*SPESA.*?([\d\.,]+)\s*€', testo, re.IGNORECASE) or \
+                    re.search(r'Importo\s*totale.*?([\d\.,]+)\s*€', testo, re.IGNORECASE) or \
+                    re.search(r'TOTALE\s*DA\s*PAGARE.*?([\d\.,]+)', testo, re.IGNORECASE)
+    if match_importo:
+        val = match_importo.group(1).replace('.', '').replace(',', '.')
+        try: importo = float(val)
+        except: pass
+
+    # Estrazione kWh per Engie/Enel
+    match_kwh = re.search(r'([\d\.,]+)\s*kWh', testo, re.IGNORECASE)
+    if match_kwh:
+        val_k = match_kwh.group(1).replace('.', '').replace(',', '.')
+        try: kwh_tot = float(val_k)
+        except: pass
+        
+    return importo, kwh_tot
+
+# ---------------------------------------------------------
+# INTERFACCIA
 # ---------------------------------------------------------
 init_db()
 
-if 'user_role' not in st.session_state:
-    st.session_state['user_role'] = 'Sergio (Admin)'
+st.title("🏠 DomusSplit Pro — Gestione & Rendicontazione Utenze")
 
-# ---------------------------------------------------------
-# SIDEBAR - NAVIGAZIONE E SELEZIONE RUOLO
-# ---------------------------------------------------------
-st.sidebar.title("🏠 DomusSplit")
-st.sidebar.markdown("---")
-role = st.sidebar.radio("Seleziona Profilo Utente:", ["Sergio (Admin)", "Claudio (Ospite)"])
-st.session_state['user_role'] = role
-st.sidebar.markdown("---")
-st.sidebar.info(f"Profilo Attivo: **{st.session_state['user_role']}**")
+ruolo = st.sidebar.radio("Seleziona Profilo Utente:", ["Sergio (Admin)", "Claudio (Ospite)"])
 
-# ---------------------------------------------------------
-# VISTA: SERGIO (ADMINISTRATOR DASHBOARD)
-# ---------------------------------------------------------
-if st.session_state['user_role'] == "Sergio (Admin)":
-    st.title("⚙️ Dashboard Amministratore — Sergio")
-    
-    tab1, tab2, tab3 = st.tabs(["➕ Nuova Bolletta", "📊 Storico & Conguagli", "⚙️ Impostazioni Sistema"])
+if ruolo == "Sergio (Admin)":
+    tab1, tab2, tab3 = st.tabs(["📄 Nuova Bolletta (PDF/Foto)", "💰 Registro Incassi Claudio", "📊 Storico Saldi & WhatsApp"])
     
     with tab1:
-        st.subheader("Inserimento e Ripartizione Utenze")
+        st.subheader("Caricamento ed Estrazione Automatica Bolletta")
+        servizio = st.selectbox("Servizio / Utenza:", ["ENGIE Monofase", "ENEL Trifase", "GPL", "TIM Mobile"])
         
+        pdf_file = st.file_uploader("Carica File PDF della Bolletta", type=["pdf"])
+        
+        imp_estratto, kwh_estratta = 0.0, 0.0
+        if pdf_file is not None:
+            imp_estratto, kwh_estratta = estrai_dati_pdf(pdf_file, servizio)
+            st.success("Estrazione dati da PDF completata!")
+            
         col1, col2 = st.columns(2)
         with col1:
-            servizio = st.selectbox("Seleziona Servizio / Utenza", [
-                "ENGIE Monofase",
-                "ENEL Trifase",
-                "GPL (Gas)",
-                "TIM Mobile"
-            ])
+            importo_tot = st.number_input("Importo Totale Bolletta (€):", value=imp_estratto, step=0.01)
             data_em = st.date_input("Data Emissione", datetime.now())
-            importo_tot = st.number_input("Importo Totale Bolletta (€)", min_value=0.0, step=0.01)
             
-        with col2:
-            quota_claudio = 0.0
-            quota_sergio = 0.0
-            
+            kwh_tot, kwh_c, mc_gpl, p_litro = 0.0, 0.0, 0.0, 0.0
             if servizio == "ENGIE Monofase":
-                kwh_tot = st.number_input("Consumo Totale kWh", min_value=0.1, step=1.0)
-                kwh_claudio = st.number_input("Consumo Claudio kWh", min_value=0.0, step=1.0)
-                if kwh_tot > 0:
-                    quota_claudio = (kwh_claudio / kwh_tot) * importo_tot
-                    quota_sergio = importo_tot - quota_claudio
-                    
-            elif servizio == "ENEL Trifase":
-                perc_claudio = st.slider("Percentuale Quota Claudio (%)", 0, 100, 40)
-                quota_claudio = (perc_claudio / 100.0) * importo_tot
-                quota_sergio = importo_tot - quota_claudio
-                
-            elif servizio == "GPL (Gas)":
-                st.caption("Conversione: 1 m³ = 4.17 Litri")
-                m3_tot = st.number_input("Consumo Totale Gas (m³)", min_value=0.1, step=0.1)
-                m3_claudio = st.number_input("Consumo Claudio Gas (m³)", min_value=0.0, step=0.1)
-                
-                litri_tot = m3_tot * 4.17
-                litri_claudio = m3_claudio * 4.17
-                
-                if litri_tot > 0:
-                    costo_litro = importo_tot / litri_tot
-                    quota_claudio = litri_claudio * costo_litro
-                    quota_sergio = importo_tot - quota_claudio
-                    st.write(f"**Litri Claudio:** {litri_claudio:.2f} L | **Costo/Litro:** €{costo_litro:.3f}")
-                    
-            elif servizio == "TIM Mobile":
-                quota_claudio = importo_tot
-                quota_sergio = 0.0
-                st.caption("Linea mobile Claudio (+39 3914050128): Addebito diretto 100%")
+                kwh_tot = st.number_input("kWh Totali Bolletta:", value=kwh_estratta)
+                kwh_c = st.number_input("kWh Contatore Claudio:", min_value=0.0)
+            elif servizio == "GPL":
+                mc_gpl = st.number_input("m³ GPL Consumati:", min_value=0.0)
+                p_litro = st.number_input("Prezzo/Litro (€):", min_value=0.0)
 
-        note_bolletta = st.text_input("Note aggiuntive (opzionale)")
-        
-        st.markdown("---")
-        st.write("### Ripartizione Calcolata:")
-        c_res1, c_res2 = st.columns(2)
-        c_res1.metric("Quota Claudio", f"€ {quota_claudio:.2f}")
-        c_res2.metric("Quota Sergio", f"€ {quota_sergio:.2f}")
-        
-        if st.button("💾 Registra Bolletta"):
+        with col2:
+            st.subheader("Ripartizione Calcolata")
+            quota_c, quota_s = 0.0, 0.0
+            
+            if servizio == "ENGIE Monofase" and kwh_tot > 0:
+                quota_c = (kwh_c / kwh_tot) * importo_tot
+                quota_s = importo_tot - quota_c
+            elif servizio == "ENEL Trifase":
+                canone_tv = st.number_input("Canone TV da defalcare (€):", value=0.0)
+                netto = importo_tot - canone_tv
+                quota_c = netto * 0.40
+                quota_s = (netto * 0.60) + canone_tv
+            elif servizio == "GPL":
+                litri = mc_gpl * 4.17
+                valore = litri * p_litro
+                quota_c = valore / 2.0
+                quota_s = valore / 2.0
+            elif servizio == "TIM Mobile":
+                quota_c = importo_tot
+                quota_s = 0.0
+                
+            st.metric("Quota Claudio", f"€ {quota_c:.2f}")
+            st.metric("Quota Sergio", f"€ {quota_s:.2f}")
+            
+            if st.button("💾 Registra in Archivio"):
+                conn = get_connection()
+                cursor = conn.cursor()
+                cursor.execute('''
+                    INSERT INTO bollette (servizio, data_emissione, importo_totale, kwh_totali, kwh_claudio, mc_gpl, prezzo_litro_gpl, quota_claudio, quota_sergio)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (servizio, data_em.strftime("%Y-%m-%d"), importo_tot, kwh_tot, kwh_c, mc_gpl, p_litro, quota_c, quota_s))
+                conn.commit()
+                conn.close()
+                st.success("Bolletta salvata correttamente!")
+
+    with tab2:
+        st.subheader("Registra Pagamento Ricevuto da Claudio")
+        c1, c2 = st.columns(2)
+        with c1:
+            data_inc = st.date_input("Data Incasso:", datetime.now())
+            imp_inc = st.number_input("Importo Ricevuto (€):", min_value=0.0, step=0.01)
+        with c2:
+            modalita = st.selectbox("Tipologia Pagamento:", ["Bonifico", "Contanti (Cash)"])
+            iban_dest = ""
+            if modalita == "Bonifico":
+                iban_dest = st.text_input("IBAN di Destinazione:", value="IT60X0000000000000000000000")
+            note_inc = st.text_input("Note/Causale:")
+            
+        if st.button("✅ Registra Incasso"):
             conn = get_connection()
             cursor = conn.cursor()
             cursor.execute('''
-                INSERT INTO bollette (servizio, data_emissione, importo_totale, quota_claudio, quota_sergio, note)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (servizio, data_em.strftime("%Y-%m-%d"), importo_tot, quota_claudio, quota_sergio, note_bolletta))
-            
-            cursor.execute('''
-                INSERT INTO storico (periodo_riferimento, importo_totale, quota_sergio, quota_claudio, note)
+                INSERT INTO incassi (data_incasso, importo, modalita, iban_destinazione, note)
                 VALUES (?, ?, ?, ?, ?)
-            ''', (f"{servizio} - {data_em.strftime('%b %Y')}", importo_tot, quota_sergio, quota_claudio, note_bolletta))
-            
+            ''', (data_inc.strftime("%Y-%m-%d"), imp_inc, modalita, iban_dest, note_inc))
             conn.commit()
             conn.close()
-            st.success("Bolletta registrata con successo nel database!")
-
-    with tab2:
-        st.subheader("Registro Generale Utenze e Saldi")
-        conn = get_connection()
-        df_bollette = pd.read_sql_query("SELECT * FROM bollette ORDER BY data_emissione DESC", conn)
-        conn.close()
-        
-        if not df_bollette.empty:
-            st.dataframe(df_bollette, use_container_width=True)
-            
-            st.markdown("### 📱 Generatore Notifica WhatsApp per Claudio")
-            tot_claudio = df_bollette['quota_claudio'].sum()
-            
-            msg = f"Ciao Claudio! 👋 Ecco il riepilogo aggiornato delle utenze Domus:\n\n"
-            for _, row in df_bollette.head(5).iterrows():
-                msg += f"• *{row['servizio']}* ({row['data_emissione']}): €{row['quota_claudio']:.2f}\n"
-            msg += f"\n*Totale da saldare: €{tot_claudio:.2f}*\n\nGrazie!"
-            
-            st.text_area("Anteprima Messaggio:", msg, height=150)
-            
-            encoded_msg = urllib.parse.quote(msg)
-            wa_url = f"https://wa.me/?text={encoded_msg}"
-            st.markdown(f"[📲 Invia Notifica via WhatsApp]({wa_url})")
-        else:
-            st.info("Nessuna bolletta presente nel database.")
+            st.success("Incasso registrato!")
 
     with tab3:
-        st.subheader("Parametri di Sistema")
+        st.subheader("Contabilità & Saldo Progressivo")
         conn = get_connection()
-        df_config = pd.read_sql_query("SELECT * FROM configurazione", conn)
+        df_b = pd.read_sql_query("SELECT * FROM bollette", conn)
+        df_i = pd.read_sql_query("SELECT * FROM incassi", conn)
         conn.close()
-        st.dataframe(df_config, use_container_width=True)
+        
+        tot_dovuto = df_b['quota_claudio'].sum() if not df_b.empty else 0.0
+        tot_incassato = df_i['importo'].sum() if not df_i.empty else 0.0
+        saldo_netto = tot_dovuto - tot_incassato
+        
+        col_s1, col_s2, col_s3 = st.columns(3)
+        col_s1.metric("Totale Spese Spettanti", f"€ {tot_dovuto:.2f}")
+        col_s2.metric("Totale Pagato da Claudio", f"€ {tot_incassato:.2f}")
+        col_s3.metric("SALDO ATTUALE (DA SALDARE)", f"€ {saldo_netto:.2f}")
+        
+        st.markdown("---")
+        st.write("### Notifica WhatsApp per Claudio")
+        msg = f"Ciao Claudio, ecco il riepilogo contabile aggiornato Domus:\n"
+        msg += f"- Addebiti Utenze Totali: € {tot_dovuto:.2f}\n"
+        msg += f"- Totale Pagamenti Ricevuti: € {tot_incassato:.2f}\n"
+        msg += f"- **SALDO NETTO DA SALDARE: € {saldo_netto:.2f}**\n\n"
+        msg += f"Puoi versare tramite Bonifico o Contanti."
+        
+        st.code(msg, language="markdown")
 
-# ---------------------------------------------------------
-# VISTA: CLAUDIO (GUEST VIEW)
-# ---------------------------------------------------------
 else:
-    st.title("🏡 Vista Ospite — Claudio")
-    st.write("Benvenuto nel portale trasparente per la consultazione dei consumi e delle quote utenze.")
-    
+    st.title("🏡 Vista Trasparenza — Claudio")
     conn = get_connection()
-    df_storico = pd.read_sql_query("SELECT id, data_registrazione, periodo_riferimento, quota_claudio, stato_pagamento FROM storico ORDER BY id DESC", conn)
+    df_b = pd.read_sql_query("SELECT servizio, data_emissione, importo_totale, quota_claudio FROM bollette", conn)
+    df_i = pd.read_sql_query("SELECT data_incasso, importo, modalita, note FROM incassi", conn)
     conn.close()
     
-    if not df_storico.empty:
-        tot_da_pagare = df_storico[df_storico['stato_pagamento'] == 'In Attesa']['quota_claudio'].sum()
-        
-        col_m1, col_m2 = st.columns(2)
-        col_m1.metric("Totale Attualmente Dovuto", f"€ {tot_da_pagare:.2f}")
-        col_m2.metric("Stato Ultimo Saldo", df_storico['stato_pagamento'].iloc[0])
-        
-        st.markdown("### Dettaglio Quote Spettanti")
-        st.dataframe(df_storico, use_container_width=True)
-        
-        st.info("💡 Per concordare il saldo o richiedere chiarimenti, contatta Sergio tramite WhatsApp.")
-    else:
-        st.info("Non ci sono quote o bollette registrate al momento.")
+    tot_dovuto = df_b['quota_claudio'].sum() if not df_b.empty else 0.0
+    tot_incassato = df_i['importo'].sum() if not df_i.empty else 0.0
+    
+    st.metric("Tuo Saldo Attuale da Saldare", f"€ {tot_dovuto - tot_incassato:.2f}")
+    
+    st.subheader("Dettaglio Addebiti Utenze")
+    st.dataframe(df_b, use_container_width=True)
+    
+    st.subheader("Storico Tuoi Pagamenti Effettuati")
+    st.dataframe(df_i, use_container_width=True)
