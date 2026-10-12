@@ -3,7 +3,6 @@ import pandas as pd
 import sqlite3
 import pdfplumber
 import re
-import urllib.parse
 from datetime import datetime
 
 # ---------------------------------------------------------
@@ -18,6 +17,10 @@ DB_NAME = "domus.db"
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
+    
+    # Reset sicuro delle tabelle per evitare incompatibilità di schema
+    cursor.execute('DROP TABLE IF EXISTS bollette')
+    cursor.execute('DROP TABLE IF EXISTS incassi')
     
     # Tabella Bollette ed Estrazioni OCR/PDF
     cursor.execute('''
@@ -43,7 +46,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             data_incasso DATE NOT NULL,
             importo REAL NOT NULL,
-            modalita TEXT NOT NULL, -- 'Bonifico' o 'Contanti'
+            modalita TEXT NOT NULL,
             iban_destinazione TEXT,
             note TEXT
         )
@@ -67,7 +70,6 @@ def estrai_dati_pdf(uploaded_file, servizio):
         for page in pdf.pages:
             testo += page.extract_text() or ""
             
-    # Estrazione Regex dell'importo totale
     match_importo = re.search(r'TOTAL[EO]\I?\s*DATI?\s*SPESA.*?([\d\.,]+)\s*€', testo, re.IGNORECASE) or \
                     re.search(r'Importo\s*totale.*?([\d\.,]+)\s*€', testo, re.IGNORECASE) or \
                     re.search(r'TOTALE\s*DA\s*PAGARE.*?([\d\.,]+)', testo, re.IGNORECASE)
@@ -76,7 +78,6 @@ def estrai_dati_pdf(uploaded_file, servizio):
         try: importo = float(val)
         except: pass
 
-    # Estrazione kWh per Engie/Enel
     match_kwh = re.search(r'([\d\.,]+)\s*kWh', testo, re.IGNORECASE)
     if match_kwh:
         val_k = match_kwh.group(1).replace('.', '').replace(',', '.')
@@ -86,7 +87,7 @@ def estrai_dati_pdf(uploaded_file, servizio):
     return importo, kwh_tot
 
 # ---------------------------------------------------------
-# INTERFACCIA
+# INIZIALIZZAZIONE & INTERFACCIA
 # ---------------------------------------------------------
 init_db()
 
